@@ -66,24 +66,32 @@ class RunwaySlotManager:
         return datetime.fromtimestamp(rounded,tz=t.tzinfo)
 
     def _sep(self, leader: str, follower: str) -> int:
-        pair = tuple(sorted((leader, follower)))
-        direct = self.wake.get(pair)
-        if direct is not None:
-            return int(direct)
-        reverse = self.wake.get((follower, leader))
-        if reverse is not None:
-            return int(reverse)
-        return int(self.wake.get(("*", follower), 60))
+        # Separation is ordered by the actual departure sequence: the leader's
+        # wake category is what governs the follower.  Sorting or falling back
+        # to the reversed pair would apply the follower->leader spacing (for
+        # example H behind L would wrongly receive L-behind-H separation).
+        exact = self.wake.get((leader, follower))
+        if exact is not None:
+            return int(exact)
+        leader_wildcard = self.wake.get((leader, "*"))
+        if leader_wildcard is not None:
+            return int(leader_wildcard)
+        follower_wildcard = self.wake.get(("*", follower))
+        if follower_wildcard is not None:
+            return int(follower_wildcard)
+        return int(self.wake.get(("*", "*"), 60))
 
     def _ctot_ok(self,req:SlotRequest,slot:datetime)->bool:
         if req.ctot is None:return True
         tol=timedelta(minutes=req.ctot_tolerance_min)
         return req.ctot-tol<=slot<=req.ctot+tol
 
-    def _conflict(self,runway:Runway,req:SlotRequest,slot:datetime)->RunwayUse|None:
+    def _conflict(self,runway:Runway,req:SlotRequest,slot:datetime,ignore_flight:str|None=None)->RunwayUse|None:
         occupancy=Window(slot,slot+timedelta(seconds=runway.occupancy_seconds))
         uses=self._uses[runway.runway_id]
         for use in uses:
+            if ignore_flight is not None and use.flight_id==ignore_flight:
+                continue
             if use.occupied.overlaps(occupancy):
                 return use
             if use.slot<=slot:
@@ -138,6 +146,36 @@ class RunwaySlotManager:
         self._uses[use.runway_id].append(committed)
         self._uses[use.runway_id].sort(key=lambda x:(x.slot,x.sequence))
         return Decision(True,"ok","runway slot committed",{"sequence":self._sequence})
+
+    def verify(self,use:RunwayUse)->Decision:
+        """Re-check a staged slot against traffic committed afterwards.
+
+        The flight's own staged use is ignored so that a joint departure
+        clearance can revalidate both gates together before advertising it.
+        """
+        if use.runway_id not in self._config:
+            return Decision(False,"configuration","runway no longer active")
+        req=SlotRequest(use.flight_id,use.operation,use.wake_category,use.slot,use.slot,use.slot,(use.runway_id,))
+        hit=self._conflict(self.runways[use.runway_id],req,use.slot,ignore_flight=use.flight_id)
+        if hit is not None:
+            return Decision(False,"slot-stale","runway sequence changed",{"conflict":hit.flight_id})
+        return Decision(True,"ok","runway slot still valid",{"sequence":use.sequence})
+
+    def slot_for(self,flight_id:str)->RunwayUse:
+        matches=[use for items in self._uses.values() for use in items if use.flight_id==flight_id]
+        if not matches:raise KeyError(f"no committed slot for {flight_id}")
+        return max(matches,key=lambda u:u.sequence)
+
+    def release(self,flight_id:str)->bool:
+        """Return a previously committed slot so the runway can be re-offered."""
+        removed=False
+        for rid in list(self._uses):
+            items=self._uses[rid]
+            keep=[u for u in items if u.flight_id!=flight_id]
+            if len(keep)!=len(items):
+                removed=True
+                self._uses[rid]=keep
+        return removed
 
     def resequence(self,runway_id:str,flight_order:Iterable[str],anchor:datetime)->tuple[RunwayUse,...]:
         order=list(flight_order)
