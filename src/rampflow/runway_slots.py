@@ -66,24 +66,27 @@ class RunwaySlotManager:
         return datetime.fromtimestamp(rounded,tz=t.tzinfo)
 
     def _sep(self, leader: str, follower: str) -> int:
-        pair = tuple(sorted((leader, follower)))
-        direct = self.wake.get(pair)
+        # The key is directional: wake separation depends on which aircraft
+        # leads and which follows, so the pair must never be reordered.
+        direct = self.wake.get((leader, follower))
         if direct is not None:
             return int(direct)
-        reverse = self.wake.get((follower, leader))
-        if reverse is not None:
-            return int(reverse)
-        return int(self.wake.get(("*", follower), 60))
+        wildcard = self.wake.get(("*", follower))
+        if wildcard is not None:
+            return int(wildcard)
+        return 60
 
     def _ctot_ok(self,req:SlotRequest,slot:datetime)->bool:
         if req.ctot is None:return True
         tol=timedelta(minutes=req.ctot_tolerance_min)
         return req.ctot-tol<=slot<=req.ctot+tol
 
-    def _conflict(self,runway:Runway,req:SlotRequest,slot:datetime)->RunwayUse|None:
+    def _conflict(self,runway:Runway,req:SlotRequest,slot:datetime,ignore_flight:str|None=None)->RunwayUse|None:
         occupancy=Window(slot,slot+timedelta(seconds=runway.occupancy_seconds))
         uses=self._uses[runway.runway_id]
         for use in uses:
+            if ignore_flight is not None and use.flight_id==ignore_flight:
+                continue
             if use.occupied.overlaps(occupancy):
                 return use
             if use.slot<=slot:
@@ -138,6 +141,34 @@ class RunwaySlotManager:
         self._uses[use.runway_id].append(committed)
         self._uses[use.runway_id].sort(key=lambda x:(x.slot,x.sequence))
         return Decision(True,"ok","runway slot committed",{"sequence":self._sequence})
+
+    def verify(self,use:RunwayUse)->Decision:
+        """Re-check a previously committed slot against the current sequence.
+
+        The flight's own use is ignored: this is the final gate revalidation
+        performed after the slot was taken, not a new request.
+        """
+        if use.runway_id not in self._config:
+            return Decision(False,"configuration","runway no longer active")
+        if not any(committed.flight_id==use.flight_id and committed.slot==use.slot and committed.runway_id==use.runway_id for committed in self._uses.get(use.runway_id,())):
+            return Decision(False,"slot-not-held","runway slot is not held by this flight")
+        runway=self.runways[use.runway_id]
+        req=SlotRequest(use.flight_id,use.operation,use.wake_category,use.slot,use.slot,use.slot,(use.runway_id,))
+        hit=self._conflict(runway,req,use.slot,ignore_flight=use.flight_id)
+        if hit is not None:
+            return Decision(False,"slot-stale","runway sequence changed",{"conflict":hit.flight_id})
+        return Decision(True,"ok","runway slot still valid",{"sequence":self._sequence})
+
+    def release(self,use:RunwayUse)->bool:
+        """Give back a committed slot. Returns True when something was removed."""
+        items=self._uses.get(use.runway_id)
+        if not items:
+            return False
+        keep=[committed for committed in items if not (committed.flight_id==use.flight_id and committed.slot==use.slot and committed.runway_id==use.runway_id)]
+        if len(keep)==len(items):
+            return False
+        self._uses[use.runway_id]=keep
+        return True
 
     def resequence(self,runway_id:str,flight_order:Iterable[str],anchor:datetime)->tuple[RunwayUse,...]:
         order=list(flight_order)

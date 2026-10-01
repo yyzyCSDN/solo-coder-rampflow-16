@@ -70,11 +70,7 @@ class RampWorkflowControl:
         return receipt
 
     def commit_departure_movement(self, operation_id: str, subject: str, at: datetime, action: Callable[[], T], requirements: tuple[Decision, ...] = ()) -> OperationReceipt:
-        event = self.stream.publish(operation_id, utc(at), "departure.movement.committed", subject, {"operation_id": operation_id})
-        result = action()
-        receipt = OperationReceipt(operation_id, event.topic, subject, event, result)
-        self._receipts[operation_id] = receipt
-        return receipt
+        return self._guard(operation_id, "departure.movement.committed", subject, at, action, requirements=requirements)
 
     def commit_stand_service_package(self, operation_id: str, subject: str, at: datetime, action: Callable[[], T], requirements: tuple[Decision, ...] = ()) -> OperationReceipt:
         return self._guard(operation_id, "stand.service.package.committed", subject, at, action, requirements=requirements)

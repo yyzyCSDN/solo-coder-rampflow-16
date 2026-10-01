@@ -161,17 +161,29 @@ class TaxiScheduler:
         return TaxiPlan(flight_id,tuple(nodes),tuple(path),tuple(uses),start,current,waiting)
 
     def commit(self,plan:TaxiPlan)->Decision:
-        for use in plan.uses:
-            edge=self.graph.edges[use.edge_id]
-            conflicts=self._group_conflicts(edge,use.window,use.direction)
-            if conflicts:
-                return Decision(False,"taxi-conflict","taxi reservation changed",{"edge":use.edge_id,"flights":[x.flight_id for x in conflicts]})
-            if edge.runway_crossing and self._crossing_allowed(edge,use.window)!=use.crossing_clearance:
-                return Decision(False,"crossing-stale","runway crossing clearance no longer matches",{"edge":use.edge_id})
+        decision=self.verify(plan)
+        if not decision.accepted:
+            return decision
         for use in plan.uses:
             self._uses.setdefault(use.edge_id,[]).append(use)
             self._uses[use.edge_id].sort(key=lambda x:(x.window.start,x.window.end,x.flight_id))
         return Decision(True,"ok","taxi plan committed",{"end":plan.end})
+
+    def verify(self,plan:TaxiPlan)->Decision:
+        """Re-validate a plan against current reservations, ignoring its own uses.
+
+        This is the revalidation gate run after the route was taken: another
+        aircraft committing the same intersection in the meantime must reject
+        the whole departure so the held route (and slot) can be returned.
+        """
+        for use in plan.uses:
+            edge=self.graph.edges[use.edge_id]
+            conflicts=[hit for hit in self._group_conflicts(edge,use.window,use.direction) if hit.flight_id!=plan.flight_id]
+            if conflicts:
+                return Decision(False,"taxi-conflict","taxi reservation changed",{"edge":use.edge_id,"flights":[x.flight_id for x in conflicts]})
+            if edge.runway_crossing and self._crossing_allowed(edge,use.window)!=use.crossing_clearance:
+                return Decision(False,"crossing-stale","runway crossing clearance no longer matches",{"edge":use.edge_id})
+        return Decision(True,"ok","taxi plan still valid",{"end":plan.end})
 
     def release(self,flight_id:str)->int:
         removed=0
